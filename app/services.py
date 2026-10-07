@@ -3,7 +3,9 @@
 并发控制策略：
 - 样品状态变更前先 SELECT ... FOR UPDATE 锁定样品行，串行化互斥操作；
 - 交接确认、隔离解除使用条件 UPDATE（WHERE status=... / version=...），
-  只有基于最新状态的操作才能生效，rowcount=0 即冲突，返回明确提示。
+  只有基于最新状态的操作才能生效，rowcount=0 即冲突，返回明确提示；
+  温区调整把带版本号的条件 UPDATE 作为事务第一条语句（PG 行锁 /
+  SQLite 写库锁一次到位），版本过期即 409 冲突，不留下部分变更。
 - 设备故障登记会影响一批样品：在事务的第一步（取任何行锁之前）对相关表执行
   LOCK TABLE ... IN EXCLUSIVE MODE（PostgreSQL）。EXCLUSIVE 与 ROW SHARE
   （SELECT FOR UPDATE）和 ROW EXCLUSIVE（INSERT/UPDATE/DELETE）都互斥，
@@ -20,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
                      QuarantineRecord, ReadingCorrection, Sample,
-                     TemperatureReading)
+                     TempRangeAdjustment, TemperatureReading)
 
 
 class DomainError(Exception):
@@ -198,6 +200,8 @@ def correct_reading(db: Session, reading_id: int, new_value: float,
         raise DomainError("更正读数必须填写理由")
     if not operator:
         raise DomainError("更正读数必须填写操作者")
+    # 锁样品行：与录温、温区调整等基于最新读数/更正状态的操作串行化
+    _lock_sample(db, reading.sample_id)
     # 原值 = 上一次更正后的值（或原始值），形成完整更正链
     last = db.scalars(
         select(ReadingCorrection).where(ReadingCorrection.reading_id == reading_id)
@@ -250,6 +254,118 @@ def release_quarantine(db: Session, sample_id: int, reason: str,
     _audit(db, sample_id, "QUARANTINE_RELEASED", released_by, {
         "reason": reason, "quarantine_ids": [q.id for q in active]})
     db.commit()
+
+
+# ---------------------------------------------------------------- 温区调整
+
+def adjust_temp_range(db: Session, sample_id: int, new_min: float, new_max: float,
+                      reason: str, operator: str, expected_version: int
+                      ) -> TempRangeAdjustment:
+    """调整样品允许温区，提交时刻生效。
+
+    - 保存旧/新温区、理由、操作者与生效时间（TempRangeAdjustment + 审计）；
+    - 历史读数原值、更正链、当时越界判定与已形成的隔离记录一律不回写；
+    - 提交时按最新一条读数的最终更正值复核新温区：
+      无读数只更新温区；越界且未隔离则立即隔离并使待确认交接失效；
+      已隔离只记录复核结果，不重复隔离；放宽温区不自动解除隔离；
+    - 与录温/更正/交接确认/解除隔离并发时基于最新状态生效：事务第一条语句即
+      执行带版本号的条件 UPDATE（PostgreSQL 下取得行锁，SQLite 下立即取得
+      写库锁），版本过期 rowcount=0 即 409 冲突，不留下部分变更。
+    """
+    reason = (reason or "").strip()
+    operator = (operator or "").strip()
+    if not reason:
+        raise DomainError("调整温区必须填写理由")
+    if not operator:
+        raise DomainError("调整温区必须填写操作者姓名")
+    if not new_min < new_max:
+        raise DomainError("允许温区下限必须小于上限")
+    # 条件更新占位（本事务第一条 SQL）：仅当页面版本与最新状态一致才生效。
+    # 该 UPDATE 在 PostgreSQL 下锁定样品行、在 SQLite 下取得写库锁，此后本事务
+    # 的复核读取与全部写入都与录温/更正/交接确认/解除隔离串行化；
+    # 版本号 SQL 侧自增，避免并发下丢失更新。
+    res = db.execute(
+        update(Sample)
+        .where(Sample.id == sample_id, Sample.version == expected_version)
+        .values(version=Sample.version + 1)
+    )
+    if res.rowcount == 0:
+        db.rollback()
+        if not db.scalar(select(func.count()).select_from(Sample)
+                         .where(Sample.id == sample_id)):
+            raise DomainError("样品不存在", 404)
+        raise ConflictError("页面版本已过期（样品状态已被其他操作变更），本次调整未生效，请刷新后重试")
+    # 已持有样品行锁（PG）/写库锁（SQLite）：读到的是最新已提交状态
+    sample = db.get(Sample, sample_id)
+    now = _now()
+    old_min, old_max = sample.temp_min, sample.temp_max
+
+    # ---- 复核：最新一条读数的最终更正值对照新温区 ----
+    reading = db.scalars(
+        select(TemperatureReading).where(TemperatureReading.sample_id == sample_id)
+        .order_by(TemperatureReading.id.desc())
+    ).first()
+    review_value: float | None = None
+    review_out_of_range = False
+    review_action = "NO_READING"
+    if reading is not None:
+        last = db.scalars(
+            select(ReadingCorrection).where(ReadingCorrection.reading_id == reading.id)
+            .order_by(ReadingCorrection.id.desc())
+        ).first()
+        review_value = last.new_value if last else reading.value
+        review_out_of_range = review_value < new_min or review_value > new_max
+        if review_out_of_range:
+            review_action = ("ALREADY_QUARANTINED" if sample.status == "QUARANTINED"
+                             else "QUARANTINED")
+        else:
+            review_action = "IN_RANGE"
+
+    adjustment = TempRangeAdjustment(
+        sample_id=sample_id, old_min=old_min, old_max=old_max,
+        new_min=new_min, new_max=new_max, reason=reason, operator=operator,
+        effective_at=now, review_reading_id=reading.id if reading else None,
+        review_value=review_value, review_out_of_range=review_out_of_range,
+        review_action=review_action)
+    db.add(adjustment)
+    db.flush()
+    # 版本号已在守卫 UPDATE 中自增，这里只落新温区
+    sample.temp_min = new_min
+    sample.temp_max = new_max
+    _audit(db, sample_id, "TEMP_RANGE_ADJUSTED", operator, {
+        "adjustment_id": adjustment.id,
+        "old_range": [old_min, old_max], "new_range": [new_min, new_max],
+        "reason": reason, "effective_at": now.isoformat(),
+        "review": {"reading_id": reading.id if reading else None,
+                   "value": review_value, "out_of_range": review_out_of_range,
+                   "action": review_action},
+        "note": "历史读数与隔离记录不回写；放宽温区不自动解除隔离"})
+
+    if review_action == "QUARANTINED":
+        # 复核越界且未隔离：立即隔离并使待确认交接失效（与越界录温同规则）
+        pending = db.scalars(
+            select(Handover).where(Handover.sample_id == sample_id,
+                                   Handover.status == "PENDING")
+        ).all()
+        for h in pending:
+            h.status = "INVALIDATED"
+            h.decided_at = now
+            _audit(db, sample_id, "HANDOVER_INVALIDATED", operator, {
+                "handover_id": h.id,
+                "reason": f"温区调整 #{adjustment.id} 复核越界"})
+        sample.status = "QUARANTINED"
+        db.add(QuarantineRecord(
+            sample_id=sample_id,
+            reason=f"温区调整后复核越界：最新读数 #{reading.id} 最终更正值 "
+                   f"{review_value}°C 超出新温区 [{new_min}, {new_max}]°C"
+                   f"（温区调整 #{adjustment.id}）"))
+        _audit(db, sample_id, "QUARANTINED", operator, {
+            "adjustment_id": adjustment.id, "reading_id": reading.id,
+            "value": review_value,
+            "invalidated_handovers": [h.id for h in pending]})
+    # ALREADY_QUARANTINED：复核结果已随调整记录与审计保存，不重复隔离、不动交接
+    db.commit()
+    return adjustment
 
 
 # ---------------------------------------------------------------- 设备故障

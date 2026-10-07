@@ -19,7 +19,7 @@ from . import services
 from .database import Base, SessionLocal, engine, get_db
 from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
                      QuarantineRecord, ReadingCorrection, Sample,
-                     TemperatureReading)
+                     TempRangeAdjustment, TemperatureReading)
 from .services import DomainError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -35,6 +35,7 @@ EVENT_NAMES = {
     "QUARANTINE_RELEASED": "隔离解除",
     "FAULT_AFFECTED": "故障影响",
     "FAULT_LINKED": "故障关联（已隔离）",
+    "TEMP_RANGE_ADJUSTED": "温区调整",
 }
 
 
@@ -275,12 +276,15 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
     for imp in impact_rows:
         impacts_by_failure.setdefault(imp.failure_id, []).append(imp)
     pending = next((h for h in handovers if h.status == "PENDING"), None)
+    adjustments = db.scalars(
+        select(TempRangeAdjustment).where(TempRangeAdjustment.sample_id == sample_id)
+        .order_by(TempRangeAdjustment.id.desc())).all()
     return render(request, "sample_detail.html",
                   sample=sample, handovers=handovers, readings=readings,
                   corrections_by_reading=corrections_by_reading, effective=effective,
                   quarantines=quarantines, audits=audits, pending=pending,
                   failure_map=failure_map, impacts_by_failure=impacts_by_failure,
-                  event_names=EVENT_NAMES)
+                  adjustments=adjustments, event_names=EVENT_NAMES)
 
 
 # ---------------------------------------------------------------- 操作
@@ -375,6 +379,38 @@ def release_quarantine(sample_id: int, reason: str = Form(...),
             return lock_conflict_redirect(db, f"/samples/{sample_id}", "解除隔离")
         raise
     return redirect(f"/samples/{sample_id}", "隔离已解除，样品恢复在库状态")
+
+
+@app.post("/samples/{sample_id}/temp-range")
+def adjust_temp_range(sample_id: int, new_min: float = Form(...),
+                      new_max: float = Form(...), reason: str = Form(...),
+                      operator: str = Form(...), expected_version: int = Form(...),
+                      db: Session = Depends(get_db)):
+    try:
+        adj = services.adjust_temp_range(db, sample_id, new_min, new_max,
+                                         reason, operator, expected_version)
+    except DomainError as e:
+        return redirect(f"/samples/{sample_id}", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, f"/samples/{sample_id}", "温区调整")
+        raise
+    if adj.review_action == "QUARANTINED":
+        return redirect(f"/samples/{sample_id}",
+                        f"温区已调整为 [{adj.new_min}, {adj.new_max}]°C；复核越界：最新读数 "
+                        f"#{adj.review_reading_id} 最终更正值 {adj.review_value}°C 超出新温区，"
+                        "样品已立即隔离，待确认交接已失效", "error")
+    if adj.review_action == "ALREADY_QUARANTINED":
+        return redirect(f"/samples/{sample_id}",
+                        f"温区已调整为 [{adj.new_min}, {adj.new_max}]°C；复核越界：最新读数 "
+                        f"#{adj.review_reading_id} 最终更正值 {adj.review_value}°C 超出新温区，"
+                        "样品本已隔离，仅记录复核结果，未重复隔离", "error")
+    if adj.review_action == "IN_RANGE":
+        return redirect(f"/samples/{sample_id}",
+                        f"温区已调整为 [{adj.new_min}, {adj.new_max}]°C；复核：最新读数 "
+                        f"#{adj.review_reading_id} 最终更正值 {adj.review_value}°C 在新温区内")
+    return redirect(f"/samples/{sample_id}",
+                    f"温区已调整为 [{adj.new_min}, {adj.new_max}]°C（暂无温度读数，仅更新温区）")
 
 
 @app.post("/failures")

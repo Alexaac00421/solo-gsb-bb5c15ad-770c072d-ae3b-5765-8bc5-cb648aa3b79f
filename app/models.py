@@ -113,6 +113,34 @@ class FailureImpact(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class TempRangeAdjustment(Base):
+    """温区调整：提交时刻生效；保存旧/新温区、理由、操作者、生效时间与复核结果。
+
+    历史读数原值、更正链、当时越界判定与已形成的隔离记录均不回写；
+    放宽温区也不自动解除隔离。
+    """
+
+    __tablename__ = "temp_range_adjustments"
+
+    id = Column(Integer, primary_key=True)
+    sample_id = Column(Integer, ForeignKey("samples.id"), nullable=False, index=True)
+    old_min = Column(Float, nullable=False)
+    old_max = Column(Float, nullable=False)
+    new_min = Column(Float, nullable=False)
+    new_max = Column(Float, nullable=False)
+    reason = Column(String(256), nullable=False)
+    operator = Column(String(64), nullable=False)
+    effective_at = Column(DateTime(timezone=True), nullable=False)  # 生效时间 = 提交时刻
+    # 提交时复核：按最新一条读数的最终更正值对照新温区（无读数则三项为空/默认值）
+    review_reading_id = Column(Integer, ForeignKey("temperature_readings.id"), nullable=True)
+    review_value = Column(Float, nullable=True)        # 最新读数的最终更正值
+    review_out_of_range = Column(Boolean, nullable=False, default=False)
+    # NO_READING 无读数仅更新 / IN_RANGE 复核未越界 /
+    # QUARANTINED 复核越界本次隔离 / ALREADY_QUARANTINED 已隔离仅记录复核结果
+    review_action = Column(String(24), nullable=False, default="NO_READING")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class AuditLog(Base):
     """审计日志：所有状态变更的完整流水，可导出。"""
 

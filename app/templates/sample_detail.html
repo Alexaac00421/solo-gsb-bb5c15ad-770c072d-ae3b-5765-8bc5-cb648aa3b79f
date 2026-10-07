@@ -90,6 +90,19 @@
     </form>
     <p class="hint">越界读数将立即隔离样品，并使待确认交接失效。</p>
   </div>
+
+  <div class="card">
+    <h3>调整允许温区</h3>
+    <form method="post" action="/samples/{{ sample.id }}/temp-range" class="form">
+      <input type="hidden" name="expected_version" value="{{ sample.version }}">
+      <label>新下限 (°C) *<input name="temp_min" type="number" step="0.1" required value="{{ sample.temp_min }}"></label>
+      <label>新上限 (°C) *<input name="temp_max" type="number" step="0.1" required value="{{ sample.temp_max }}"></label>
+      <label>理由 *<input name="reason" required placeholder="如 实验方案 v3 放宽温区"></label>
+      <label>姓名 *<input name="operator" required placeholder="操作者"></label>
+      <button type="submit" class="btn">提交调整</button>
+    </form>
+    <p class="hint">提交时刻生效；提交时按最新一条读数的最终更正值复核新温区，越界且未隔离将立即隔离。历史读数与既有隔离记录不回写，放宽温区不自动解除隔离。</p>
+  </div>
 </div>
 
 {% if pending %}
@@ -166,6 +179,37 @@
     </tbody>
   </table>
   <p class="hint">更正保留原值、理由与操作者；更正不会自动解除隔离。</p>
+</div>
+
+<div class="card">
+  <h3>温区调整记录</h3>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>旧温区 (°C)</th><th>新温区 (°C)</th><th>理由</th><th>操作者</th><th>生效时间</th><th>提交时复核（最新读数最终更正值）</th></tr>
+    </thead>
+    <tbody>
+      {% for a in adjustments %}
+      <tr>
+        <td>#{{ a.id }}</td>
+        <td>{{ a.old_min }} ~ {{ a.old_max }}</td>
+        <td><b>{{ a.new_min }} ~ {{ a.new_max }}</b></td>
+        <td>{{ a.reason }}</td>
+        <td>{{ a.operator }}</td>
+        <td>{{ a.effective_at | dt }}</td>
+        <td>
+          {% if a.recheck_action == 'NO_READING' %}无读数，仅更新温区
+          {% elif a.recheck_action == 'IN_RANGE' %}读数 #{{ a.recheck_reading_id }} 有效值 {{ a.recheck_value }}°C：在新温区内
+          {% elif a.recheck_action == 'QUARANTINED' %}<span class="badge bad">越界·已立即隔离</span> 读数 #{{ a.recheck_reading_id }} 有效值 {{ a.recheck_value }}°C
+          {% else %}<span class="badge muted">越界·已隔离仅记录</span> 读数 #{{ a.recheck_reading_id }} 有效值 {{ a.recheck_value }}°C
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">暂无温区调整记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">调整以提交时刻生效；历史读数原值、更正链、当时越界判定及已形成的隔离记录不回写。</p>
 </div>
 
 <div class="card">
